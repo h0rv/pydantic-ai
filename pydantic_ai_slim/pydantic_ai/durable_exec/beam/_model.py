@@ -10,7 +10,6 @@ from pydantic_ai import (
     ModelResponse,
     ModelResponseStreamEvent,
 )
-from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
@@ -71,12 +70,10 @@ class BEAMModel(WrapperModel):
         *,
         workflow_id: str,
         step_counter: StepCounter,
-        event_stream_handler: EventStreamHandler[Any] | None = None,
     ):
         super().__init__(model)
         self._workflow_id = workflow_id
         self._step_counter = step_counter
-        self.event_stream_handler = event_stream_handler
 
     async def request(
         self,
@@ -119,20 +116,11 @@ class BEAMModel(WrapperModel):
             yield BEAMStreamedResponse(model_request_parameters, deserialize_model_response(cached))
             return
 
+        # Yield the real stream for real-time tokens; checkpoint after the caller finishes consuming it.
         async with super().request_stream(
             messages, model_settings, model_request_parameters, run_context
         ) as streamed_response:
-            if self.event_stream_handler is not None:
-                assert run_context is not None, (
-                    'A BEAM model cannot be used with `pydantic_ai.direct.model_request_stream()` '
-                    'as it requires a `run_context`. Set an `event_stream_handler` on the agent '
-                    'and use `agent.run()` instead.'
-                )
-                await self.event_stream_handler(run_context, streamed_response)
-
-            async for _ in streamed_response:
-                pass
-
-        response = streamed_response.get()
-        set_checkpoint(self._workflow_id, step_id, serialize_model_response(response))
-        yield BEAMStreamedResponse(model_request_parameters, response)
+            yield streamed_response
+            # Caller has finished iterating — checkpoint the complete response.
+            response = streamed_response.get()
+            set_checkpoint(self._workflow_id, step_id, serialize_model_response(response))

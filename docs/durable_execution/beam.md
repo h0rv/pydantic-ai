@@ -114,9 +114,9 @@ BEAM checkpoints step outputs to ETS using JSON serialization. This means tool r
 
 ### Streaming
 
-Because BEAM workflows checkpoint the full model response, [`Agent.run_stream()`][pydantic_ai.agent.Agent.run_stream], [`Agent.run_stream_events()`][pydantic_ai.agent.Agent.run_stream_events], and [`Agent.iter()`][pydantic_ai.agent.Agent.iter] are not supported inside a BEAM workflow.
+Since BEAM runs Python in-process, [`BEAMAgent.run_stream()`][pydantic_ai.durable_exec.beam.BEAMAgent.run_stream] supports real-time token streaming inside BEAM workflows. Model tokens are passed through to the caller as they arrive, and the complete response is checkpointed to ETS after the stream finishes. On replay after a crash, completed streaming steps return their cached results instantly.
 
-Instead, you can implement streaming by setting an [`event_stream_handler`][pydantic_ai.agent.EventStreamHandler] on the `Agent` or `BEAMAgent` instance and using [`BEAMAgent.run()`][pydantic_ai.durable_exec.beam.BEAMAgent.run]. The event stream handler function will receive the agent [run context][pydantic_ai.tools.RunContext] and an async iterable of events from the model's streaming response and the agent's execution of tools. For examples, see the [streaming docs](../agent.md#streaming-all-events).
+[`Agent.run_stream_events()`][pydantic_ai.agent.Agent.run_stream_events] is not supported inside a BEAM workflow. Use [`run_stream()`][pydantic_ai.durable_exec.beam.BEAMAgent.run_stream] instead, or set an [`event_stream_handler`][pydantic_ai.agent.EventStreamHandler] on the agent and use [`BEAMAgent.run()`][pydantic_ai.durable_exec.beam.BEAMAgent.run]. The event stream handler function will receive the agent [run context][pydantic_ai.tools.RunContext] and an async iterable of events from the model's streaming response and the agent's execution of tools. For examples, see the [streaming docs](../agent.md#streaming-all-events).
 
 Each event is automatically pushed to pg subscribers, allowing Erlang processes to consume the stream in real time:
 

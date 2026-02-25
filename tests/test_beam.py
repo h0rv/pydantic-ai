@@ -295,19 +295,49 @@ class TestBEAMCheckpointing:
 
 
 class TestBEAMStreaming:
-    async def test_run_stream_raises_in_beam(self) -> None:
-        """When in BEAM worker, `run_stream()` should raise UserError."""
+    async def test_run_stream_works_in_beam(self) -> None:
+        """run_stream() should work inside BEAM worker with checkpointed model requests."""
+        store, mock_erl = make_mock_erlang()
         agent = Agent(name='stream_agent', model=TestModel())
+        beam_agent = BEAMAgent(agent)
+
+        with (
+            patch(f'{AGENT_MODULE}.in_beam_worker', return_value=True),
+            patch(f'{MODEL_MODULE}.in_beam_worker', return_value=True),
+            patch(f'{CHECKPOINT_MODULE}.get_erlang', return_value=mock_erl),
+        ):
+            async with beam_agent.run_stream('Hello') as result:
+                output = await result.get_output()
+            assert isinstance(output, str)
+
+        # Workflow completed — verify the workflow status was set
+        wf_keys = [k for k in store if k.startswith('beam_wf:')]
+        assert len(wf_keys) == 1
+        assert store[wf_keys[0]]['status'] == 'completed'
+
+    async def test_run_stream_delegates_outside_beam(self) -> None:
+        """When not in BEAM worker, run_stream() delegates to the wrapped agent."""
+        agent = Agent(name='delegate_stream_agent', model=TestModel())
+        beam_agent = BEAMAgent(agent)
+
+        with patch(f'{AGENT_MODULE}.in_beam_worker', return_value=False):
+            async with beam_agent.run_stream('Hello') as result:
+                output = await result.get_output()
+            assert isinstance(output, str)
+
+    async def test_run_stream_events_raises_in_beam(self) -> None:
+        """When in BEAM worker, `run_stream_events()` should raise UserError."""
+        agent = Agent(name='stream_events_agent', model=TestModel())
         beam_agent = BEAMAgent(agent)
 
         with (
             patch(f'{AGENT_MODULE}.in_beam_worker', return_value=True),
             pytest.raises(
                 UserError,
-                match=re.escape('`agent.run_stream()` cannot be used inside a BEAM workflow.'),
+                match=re.escape('`agent.run_stream_events()` cannot be used inside a BEAM workflow.'),
             ),
         ):
-            async with beam_agent.run_stream('Hello'):
+            async for _ in beam_agent.run_stream_events('Hello'):
                 pass  # pragma: no cover
 
 

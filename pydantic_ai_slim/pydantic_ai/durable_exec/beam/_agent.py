@@ -91,7 +91,6 @@ class BEAMAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             wrapped.model,
             workflow_id='',
             step_counter=self._step_counter,
-            event_stream_handler=self.event_stream_handler,
         )
         self._model = beam_model
 
@@ -553,31 +552,43 @@ class BEAMAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         Returns:
             The result of the run.
         """
-        if in_beam_worker():
+        if model is not None and not isinstance(model, BEAMModel):
             raise UserError(
-                '`agent.run_stream()` cannot be used inside a BEAM workflow. '
-                'Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+                'Non-BEAM model cannot be set at agent run time inside a BEAM workflow, it must be set at agent creation time.'
             )
 
-        async with super().run_stream(
-            user_prompt,
-            output_type=output_type,
-            message_history=message_history,
-            deferred_tool_results=deferred_tool_results,
-            model=model,
-            instructions=instructions,
-            deps=deps,
-            model_settings=model_settings,
-            usage_limits=usage_limits,
-            usage=usage,
-            metadata=metadata,
-            infer_name=infer_name,
-            toolsets=toolsets,
-            builtin_tools=builtin_tools,
-            event_stream_handler=event_stream_handler,
-            **_deprecated_kwargs,
-        ) as result:
-            yield result
+        workflow_id = str(uuid.uuid4())
+        self._step_counter.reset()
+        self._set_workflow_id(workflow_id)
+
+        if in_beam_worker():
+            assert self._name is not None
+            start_workflow(workflow_id, self._name)
+
+        try:
+            with self._beam_overrides():
+                async with super(WrapperAgent, self).run_stream(
+                    user_prompt,
+                    output_type=output_type,
+                    message_history=message_history,
+                    deferred_tool_results=deferred_tool_results,
+                    model=model,
+                    instructions=instructions,
+                    deps=deps,
+                    model_settings=model_settings,
+                    usage_limits=usage_limits,
+                    usage=usage,
+                    metadata=metadata,
+                    infer_name=infer_name,
+                    toolsets=toolsets,
+                    builtin_tools=builtin_tools,
+                    event_stream_handler=event_stream_handler,
+                    **_deprecated_kwargs,
+                ) as result:
+                    yield result
+        finally:
+            if in_beam_worker():
+                complete_workflow(workflow_id)
 
     @overload
     def run_stream_events(
@@ -693,9 +704,27 @@ class BEAMAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             An async iterable of stream events `AgentStreamEvent` and finally a `AgentRunResultEvent` with the final
             run result.
         """
-        raise UserError(
-            '`agent.run_stream_events()` cannot be used with BEAM. '
-            'Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+        if in_beam_worker():
+            raise UserError(
+                '`agent.run_stream_events()` cannot be used inside a BEAM workflow. '
+                'Use `agent.run_stream()` or set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+            )
+
+        return super().run_stream_events(
+            user_prompt,
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            instructions=instructions,
+            deps=deps,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            metadata=metadata,
+            infer_name=infer_name,
+            toolsets=toolsets,
+            builtin_tools=builtin_tools,
         )
 
     @overload
