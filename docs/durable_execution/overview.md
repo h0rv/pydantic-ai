@@ -2,10 +2,13 @@
 
 Pydantic AI allows you to build durable agents that can preserve their progress across transient API failures and application errors or restarts, and handle long-running, asynchronous, and human-in-the-loop workflows with production-grade reliability. Durable agents have full support for [streaming](../agent.md#streaming-all-events) and [MCP](../mcp/client.md), with the added benefit of fault tolerance.
 
-Pydantic AI natively supports three durable execution solutions:
+Pydantic AI natively supports four durable execution solutions:
 
 - [Temporal](./temporal.md)
 - [DBOS](./dbos.md)
 - [Prefect](./prefect.md)
+- [BEAM](./beam.md)
+
+[BEAM](./beam.md) is unique among these integrations: Python runs **in-process** inside the BEAM VM via `erlang_python`, with checkpoints stored in ETS and crash recovery handled by OTP supervisors. There are no external dependencies -- everything is built into OTP.
 
 These integrations only use Pydantic AI's public interface, so they also serve as a reference for integrating with other durable systems.
