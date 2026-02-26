@@ -1,39 +1,42 @@
 # Durable Execution with BEAM
 
-[BEAM](https://www.erlang.org/) is the virtual machine that runs Erlang (and Elixir). Using [`erlang_python`](https://github.com/benoitc/erlang-python), Python runs **in-process** inside BEAM workers, giving Pydantic AI agents access to OTP's supervision, checkpointing, and distribution with zero external dependencies.
+[BEAM](https://www.erlang.org/) is the virtual machine that runs Erlang (and Elixir). Using [`erlang_python`](https://github.com/benoitc/erlang-python), Python runs **in-process** inside BEAM workers, giving Pydantic AI agents access to OTP supervision, checkpointing, and distribution with zero external dependencies.
+
+A few BEAM-specific terms used throughout this page:
+
+| Term | Meaning |
+|---|---|
+| **OTP** | Open Telecom Platform — Erlang's standard library of patterns for building fault-tolerant systems (supervisors, GenServers, etc.) |
+| **ETS** | Erlang Term Storage — an in-memory key-value store built into the BEAM, used here for checkpoints |
+| **pg** | Process Groups — an OTP module for pub/sub between Erlang/Elixir processes (not PostgreSQL 😉) |
+| **NIF** | Native Implemented Function — BEAM's FFI, similar to Python C extensions or Rust bindings via PyO3. `erlang_python` uses one to embed a Python interpreter directly in the BEAM process |
+| **GenServer** | Generic Server — an OTP behaviour for stateful processes with a standard call/cast interface |
 
 ## Durable Execution
 
-`BEAMAgent` makes your agent **durable** by checkpointing model requests and tool calls to ETS (Erlang Term Storage). If the BEAM process crashes, the OTP supervisor restarts it and the agent automatically resumes from the last completed step.
+`BEAMAgent` makes your agent **durable** by checkpointing model requests and tool calls to ETS. If the BEAM process crashes, the OTP supervisor restarts it and the agent automatically resumes from the last completed step.
 
 * **Workflows** wrap the full agent run. On crash, the supervisor restarts the process and replays from checkpoints.
 * **Steps** wrap individual model requests and tool calls. Each step's result is checkpointed to ETS before continuing.
 
 Every step output is stored in ETS via `erlang_python`'s built-in shared state API. When a workflow is replayed after a crash, completed steps return their cached results and execution resumes from the first incomplete step.
 
-The diagram below shows the overall architecture of an agentic application on BEAM. `erlang_python` runs Python in-process via a NIF -- there is no network hop between Python and Erlang.
+```mermaid
+flowchart TB
+    S[OTP Supervisor]
 
-```text
-+------------------------------------------------------+
-|  Python (BEAM worker via erlang_python)               |
-|                                                       |
-|  BEAMAgent(agent)                                     |
-|    +-- BEAMModel(model)                               |
-|    |     +-- request() -> checkpoint to ETS           |
-|    +-- BEAMToolset(toolset)                           |
-|          +-- call_tool() -> checkpoint to ETS         |
-+------------------------------------------------------+
-                        |
-                        v
-+------------------------------------------------------+
-|  Erlang (OTP)                                        |
-|                                                       |
-|  supervisor (simple_one_for_one)                      |
-|    +-- workflow process (gen_server per agent run)     |
-|          +-- ETS: checkpoint step results             |
-|          +-- pg: publish events to subscribers        |
-|          +-- on crash: restart -> read ETS -> resume  |
-+------------------------------------------------------+
+    subgraph py["Python — erlang_python NIF"]
+        A[BEAMAgent] --> M[BEAMModel]
+        A --> T[BEAMToolset]
+    end
+
+    E[(ETS checkpoints)]
+    P[pg subscribers]
+
+    S -.->|"crash → restart → resume"| py
+    M -->|checkpoint| E
+    T -->|checkpoint| E
+    A -->|events| P
 ```
 
 See the [`erlang_python` documentation](https://github.com/benoitc/erlang-python) for more information.
@@ -85,14 +88,22 @@ def run_agent(prompt: str) -> str:  # (3)!
 
 1. Wrapping the agent enables durable execution when running inside a BEAM worker.
 2. [`BEAMAgent.run()`][pydantic_ai.durable_exec.beam.BEAMAgent.run] works like [`Agent.run()`][pydantic_ai.agent.Agent.run], but checkpoints model requests and tool calls to ETS.
-3. This function is called from Erlang via `py:call(my_agent_module, run_agent, [Prompt])`.
+3. This function is called from BEAM via `py:call` (Erlang) or `:py.call` (Elixir).
 4. The agent's `name` is used to uniquely identify its workflows.
 
-Then from Erlang:
+Then from BEAM:
 
-```erlang
-{ok, Result} = py:call(my_agent_module, run_agent, [<<"How do BEAM processes achieve fault tolerance?">>]).
-```
+=== "Elixir"
+
+    ```elixir
+    {:ok, result} = :py.call(:my_agent_module, :run_agent, ["How do BEAM processes achieve fault tolerance?"])
+    ```
+
+=== "Erlang"
+
+    ```erlang
+    {ok, Result} = py:call(my_agent_module, run_agent, [<<"How do BEAM processes achieve fault tolerance?">>]).
+    ```
 
 ## BEAM Integration Considerations
 
@@ -146,16 +157,30 @@ agent = Agent(
 beam_agent = BEAMAgent(agent)
 ```
 
-On the Erlang side, subscribe to workflow events via `pg:join/3`:
+On the BEAM side, subscribe to workflow events via `pg:join`:
 
-```erlang
-pg:join(beam_workflows, WorkflowId, self()).
+=== "Elixir"
 
-%% In your gen_server handle_info
-handle_info({beam_event, _WorkflowId, EventData}, State) ->
-    %% Forward to WebSocket, log, etc.
-    {noreply, State}.
-```
+    ```elixir
+    :pg.join(:beam_workflows, workflow_id, self())
+
+    # In your GenServer handle_info
+    def handle_info({:beam_event, _workflow_id, event_data}, state) do
+      # Forward to LiveView, WebSocket, log, etc.
+      {:noreply, state}
+    end
+    ```
+
+=== "Erlang"
+
+    ```erlang
+    pg:join(beam_workflows, WorkflowId, self()).
+
+    %% In your gen_server handle_info
+    handle_info({beam_event, _WorkflowId, EventData}, State) ->
+        %% Forward to WebSocket, log, etc.
+        {noreply, State}.
+    ```
 
 ### Parallel Tool Execution
 
@@ -179,125 +204,309 @@ Pydantic AI generates telemetry events for each agent run, model request, and to
 
 Since BEAM runs Python in-process, Logfire instrumentation works the same as in any other Python application — configure Logfire as usual and all Pydantic AI spans will be emitted automatically. See the [Logfire documentation](../logfire.md) for setup instructions.
 
+To forward Python `logging` output (including HTTP request logs from provider clients) to Erlang's logger, call `py:configure_logging/1` (or `:py.configure_logging/1` in Elixir) at startup:
+
+=== "Elixir"
+
+    ```elixir
+    :py.configure_logging(%{level: :info})
+    ```
+
+=== "Erlang"
+
+    ```erlang
+    py:configure_logging(#{level => info}).
+    ```
+
+This is useful during development to see what the agent and provider client are doing without setting up Logfire.
+
 ## Worker Pool Sizing
 
-Each reentrant callback consumes a worker from the pool. During an agent run, both the outer `py:call` (running the agent) and inner callbacks (checkpoints) need workers simultaneously.
+Each agent run occupies one worker for its duration. The checkpoint callbacks (`beam_ckpt_get`, `beam_ckpt_set`, etc.) are pure ETS operations in Erlang — they don't call back into Python — so no additional workers are consumed per run.
 
-**Minimum pool size**: `max_concurrent_agent_runs * 2 + 1`
+**Minimum pool size**: `max_concurrent_agent_runs`
 
-For example, if you expect up to 4 concurrent agent runs, configure at least 9 workers in `sys.config`:
+A starting configuration for 4 concurrent agent runs:
 
-```erlang
-[{erlang_python, [
-    {num_workers, 9}
-]}].
-```
+=== "Elixir"
 
-## Erlang Setup
+    ```elixir title="config/config.exs"
+    config :erlang_python, num_workers: 4
+    ```
 
-### rebar.config
+=== "Erlang"
 
-Add `erlang_python` as a dependency:
+    ```erlang title="config/sys.config"
+    [{erlang_python, [{num_workers, 4}]}].
+    ```
 
-```erlang
-{deps, [
-    {erlang_python, "0.3.0"}
-]}.
-```
+## BEAM Setup
 
-### sys.config
+`erlang_python` works from both Erlang and Elixir — the `:py` module API is identical, just with different syntax. The examples below show both.
 
-Configure the worker pool:
+### Dependency
 
-```erlang
-[
-    {erlang_python, [
-        {num_workers, 9},
-        {num_executors, 4}
-    ]}
-].
-```
+=== "Elixir"
+
+    ```elixir title="mix.exs"
+    defp deps do
+      [
+        {:erlang_python, "~> 1.8"}
+      ]
+    end
+    ```
+
+=== "Erlang"
+
+    ```erlang title="rebar.config"
+    {deps, [
+        {erlang_python, "~> 1.8"}
+    ]}.
+    ```
+
+### Worker Pool Configuration
+
+=== "Elixir"
+
+    ```elixir title="config/config.exs"
+    config :erlang_python,
+      num_workers: 4,
+      num_executors: 4
+    ```
+
+=== "Erlang"
+
+    ```erlang title="config/sys.config"
+    [
+        {erlang_python, [
+            {num_workers, 4},
+            {num_executors, 4}
+        ]}
+    ].
+    ```
+
+### Python Environment Setup
+
+Before calling into Python, each worker needs the venv's site-packages and your application's Python directory on `sys.path`. There are three things to get right:
+
+**Use `site.addsitedir()`, not `sys.path.insert()`** — `site.addsitedir()` processes `.pth` files in the directory, which is required for editable installs (`pip install -e`) and many normal package installs. Plain `sys.path.insert()` skips `.pth` processing and will silently fail to find packages installed this way.
+
+**Use absolute paths** — relative paths resolve against the OS process working directory at the time of the call, which may differ from where your node was launched.
+
+**Pin calls with `py:bind()` / `:py.bind()`** — `erlang_python` routes each call to a worker from the pool. Without binding, path setup and your actual `py:call` may land on different workers and won't share interpreter state.
+
+=== "Elixir"
+
+    ```elixir
+    defp setup_python_env do
+      cwd = File.cwd!()
+      app_dir = Path.join(cwd, "python")  # your Python source dir
+      venv_lib = Path.join([cwd, ".venv", "lib"])
+      site_packages = find_site_packages(venv_lib)
+      Enum.each([app_dir | site_packages], &inject_path/1)
+    end
+
+    defp inject_path(path) do
+      :py.exec("import site; site.addsitedir('#{path}')")
+    end
+
+    defp find_site_packages(venv_lib) do
+      case File.ls(venv_lib) do
+        {:ok, entries} ->
+          entries
+          |> Enum.filter(&String.starts_with?(&1, "python"))
+          |> Enum.map(&Path.join([venv_lib, &1, "site-packages"]))
+          |> Enum.filter(&File.dir?/1)
+        _ -> []
+      end
+    end
+    ```
+
+    Then at call sites:
+
+    ```elixir
+    def run_agent(prompt) do
+      :py.bind()            # pin to one worker
+      setup_python_env()    # path setup runs on the same worker
+      {:ok, result} = :py.call(:my_module, :run_agent, [prompt])
+      :py.unbind()
+      result
+    end
+    ```
+
+=== "Erlang"
+
+    ```erlang
+    setup_python_env() ->
+        {ok, Cwd} = file:get_cwd(),
+        AppDir = filename:join(Cwd, "python"),  %% your Python source dir
+        VenvLib = filename:join([Cwd, ".venv", "lib"]),
+        SitePackagesDirs = find_site_packages(VenvLib),
+        [inject_path(P) || P <- [AppDir | SitePackagesDirs]].
+
+    inject_path(Path) ->
+        Code = io_lib:format("import site; site.addsitedir('~s')", [Path]),
+        py:exec(list_to_binary(lists:flatten(Code))).
+
+    find_site_packages(VenvLib) ->
+        case file:list_dir(VenvLib) of
+            {ok, Entries} ->
+                [filename:join([VenvLib, E, "site-packages"])
+                 || E <- Entries,
+                    lists:prefix("python", E),
+                    filelib:is_dir(filename:join([VenvLib, E, "site-packages"]))];
+            _ -> []
+        end.
+    ```
+
+    Then at call sites:
+
+    ```erlang
+    run_agent(Prompt) ->
+        py:bind(),             %% pin to one worker
+        setup_python_env(),    %% path setup runs on the same worker
+        {ok, Result} = py:call(my_module, run_agent, [Prompt]),
+        py:unbind(),
+        Result.
+    ```
 
 ### Application Startup
 
-Start `erlang_python` and add the companion module to your supervision tree:
+=== "Elixir"
 
-```erlang
-application:ensure_all_started(erlang_python).
-```
+    ```elixir title="lib/my_app/application.ex"
+    def start(_type, _args) do
+      children = [
+        AgentDurable
+      ]
+      Supervisor.start_link(children, strategy: :one_for_one)
+    end
+    ```
 
-```erlang
-%% In your application's start/2 callback
-start(_StartType, _StartArgs) ->
-    Children = [
-        #{id => agent_durable, start => {agent_durable, start_link, []}}
-    ],
-    {ok, {#{strategy => one_for_one, intensity => 5, period => 10}, Children}}.
-```
+=== "Erlang"
 
-### Reference Erlang Module
+    ```erlang
+    %% In your application's start/2 callback
+    start(_StartType, _StartArgs) ->
+        Children = [
+            #{id => agent_durable, start => {agent_durable, start_link, []}}
+        ],
+        {ok, {#{strategy => one_for_one, intensity => 5, period => 10}, Children}}.
+    ```
+
+### Reference Companion Module
 
 Checkpoint storage uses `erlang_python`'s built-in shared state API (`state_set`/`state_get` in Python, `py:state_store`/`py:state_fetch` in Erlang). The companion module below registers functions for event publishing and workflow lifecycle:
 
-| Python calls | Erlang registered function | Purpose |
+| Python calls | Registered function | Purpose |
 |---|---|---|
-| `erlang.call('beam_event_publish', wf_id, data)` | `agent_durable:event_publish/2` | Push event to pg subscribers |
-| `erlang.call('beam_workflow_start', wf_id, name)` | `agent_durable:workflow_start/2` | Register workflow |
-| `erlang.call('beam_workflow_complete', wf_id)` | `agent_durable:workflow_complete/1` | Mark done, clean up |
+| `erlang.call('beam_event_publish', wf_id, data)` | `event_publish/2` | Push event to pg subscribers |
+| `erlang.call('beam_workflow_start', wf_id, name)` | `workflow_start/2` | Register workflow |
+| `erlang.call('beam_workflow_complete', wf_id)` | `workflow_complete/1` | Mark done, clean up |
 
-```erlang
--module(agent_durable).
--behaviour(gen_server).
+=== "Elixir"
 
--export([start_link/0, start_link/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
--export([workflow_start/2, workflow_complete/1, event_publish/2]).
+    ```elixir title="lib/my_app/agent_durable.ex"
+    defmodule AgentDurable do
+      use GenServer
 
-start_link() ->
-    start_link([]).
+      def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-start_link(Opts) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
+      def init(_opts) do
+        :ets.new(:beam_workflows, [:named_table, :set, :public, read_concurrency: true])
+        :py.register_function(:beam_workflow_start, __MODULE__, :workflow_start)
+        :py.register_function(:beam_workflow_complete, __MODULE__, :workflow_complete)
+        :py.register_function(:beam_event_publish, __MODULE__, :event_publish)
+        {:ok, %{}}
+      end
 
-init(_Opts) ->
-    ets:new(beam_workflows, [named_table, set, public, {read_concurrency, true}]),
-    py:register_function(beam_workflow_start, ?MODULE, workflow_start),
-    py:register_function(beam_workflow_complete, ?MODULE, workflow_complete),
-    py:register_function(beam_event_publish, ?MODULE, event_publish),
-    {ok, #{}}.
+      def workflow_start([workflow_id, agent_name]) do
+        :ets.insert(:beam_workflows, {workflow_id, agent_name, :running, :erlang.system_time(:second)})
+        :pg.join(:beam_workflows, workflow_id, self())
+        :ok
+      end
 
-workflow_start(WorkflowId, AgentName) ->
-    ets:insert(beam_workflows, {WorkflowId, AgentName, running, erlang:system_time(second)}),
-    pg:join(beam_workflows, WorkflowId, self()),
-    ok.
+      def workflow_complete([workflow_id]) do
+        :ets.insert(:beam_workflows, {workflow_id, nil, :completed, :erlang.system_time(:second)})
+        cleanup_checkpoints(workflow_id)
+        :pg.leave(:beam_workflows, workflow_id, self())
+        :ok
+      end
 
-workflow_complete(WorkflowId) ->
-    ets:insert(beam_workflows, {WorkflowId, undefined, completed, erlang:system_time(second)}),
-    cleanup_checkpoints(WorkflowId),
-    pg:leave(beam_workflows, WorkflowId, self()),
-    ok.
+      def event_publish([workflow_id, event_data]) do
+        :pg.get_members(:beam_workflows, workflow_id)
+        |> Enum.each(&send(&1, {:beam_event, workflow_id, event_data}))
+        :ok
+      end
 
-event_publish(WorkflowId, EventData) ->
-    lists:foreach(fun(Pid) ->
-        Pid ! {beam_event, WorkflowId, EventData}
-    end, pg:get_members(beam_workflows, WorkflowId)),
-    ok.
+      defp cleanup_checkpoints(workflow_id) do
+        prefix = "beam_ckpt:" <> (:erlang.term_to_binary(workflow_id) |> Base.encode64()) <> ":"
+        :py.state_keys()
+        |> Enum.filter(&String.starts_with?(&1, prefix))
+        |> Enum.each(&:py.state_delete/1)
+      end
 
-cleanup_checkpoints(WorkflowId) ->
-    Prefix = <<"beam_ckpt:", (erlang:term_to_binary(WorkflowId))/binary, ":">>,
-    lists:foreach(fun(Key) ->
-        case binary:match(Key, Prefix) of
-            {0, _} -> py:state_delete(Key);
-            _ -> ok
-        end
-    end, py:state_keys()).
+      def handle_call(_request, _from, state), do: {:reply, :ok, state}
+      def handle_cast(_msg, state), do: {:noreply, state}
+      def handle_info(_info, state), do: {:noreply, state}
+    end
+    ```
 
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
+=== "Erlang"
 
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+    ```erlang title="src/agent_durable.erl"
+    -module(agent_durable).
+    -behaviour(gen_server).
 
-handle_info(_Info, State) ->
-    {noreply, State}.
-```
+    -export([start_link/0, start_link/1]).
+    -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+    -export([workflow_start/2, workflow_complete/1, event_publish/2]).
+
+    start_link() ->
+        start_link([]).
+
+    start_link(Opts) ->
+        gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
+
+    init(_Opts) ->
+        ets:new(beam_workflows, [named_table, set, public, {read_concurrency, true}]),
+        py:register_function(beam_workflow_start, ?MODULE, workflow_start),
+        py:register_function(beam_workflow_complete, ?MODULE, workflow_complete),
+        py:register_function(beam_event_publish, ?MODULE, event_publish),
+        {ok, #{}}.
+
+    workflow_start(WorkflowId, AgentName) ->
+        ets:insert(beam_workflows, {WorkflowId, AgentName, running, erlang:system_time(second)}),
+        pg:join(beam_workflows, WorkflowId, self()),
+        ok.
+
+    workflow_complete(WorkflowId) ->
+        ets:insert(beam_workflows, {WorkflowId, undefined, completed, erlang:system_time(second)}),
+        cleanup_checkpoints(WorkflowId),
+        pg:leave(beam_workflows, WorkflowId, self()),
+        ok.
+
+    event_publish(WorkflowId, EventData) ->
+        lists:foreach(fun(Pid) ->
+            Pid ! {beam_event, WorkflowId, EventData}
+        end, pg:get_members(beam_workflows, WorkflowId)),
+        ok.
+
+    cleanup_checkpoints(WorkflowId) ->
+        Prefix = <<"beam_ckpt:", (erlang:term_to_binary(WorkflowId))/binary, ":">>,
+        lists:foreach(fun(Key) ->
+            case binary:match(Key, Prefix) of
+                {0, _} -> py:state_delete(Key);
+                _ -> ok
+            end
+        end, py:state_keys()).
+
+    handle_call(_Request, _From, State) ->
+        {reply, ok, State}.
+
+    handle_cast(_Msg, State) ->
+        {noreply, State}.
+
+    handle_info(_Info, State) ->
+        {noreply, State}.
+    ```
